@@ -1,4 +1,5 @@
 #pragma once
+#include "diffxpbd/kinematic_collider.hpp"
 #include <array>
 #include <cstddef>
 #include <iostream>
@@ -157,6 +158,9 @@ void calBendingConstraint_i(const std::vector<Eigen::Vector3d>& positions, const
 
 
 // one step forward simulation of the mesh state using XPBD, with optional kinematic collider.
-bool advanceState(const mesh& m, const material& mat, const parameters& params, state& s, const std::vector<Eigen::Vector3d>& collider_positions = {});
+// Collider input is borrowed for this call and remains outside the dynamic state.
+// Returns false if the supplied collider geometry or substep duration is invalid.
+bool advanceState(const mesh& m, const material& mat, const parameters& params, state& s,
+                  const diffxpbd::ColliderInput* collider = nullptr);
 
 

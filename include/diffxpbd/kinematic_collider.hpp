@@ -40,4 +40,12 @@ private:
     PositionSampler motion_; // Given a time in seconds, it returns the world-space position of every vertex in the original vertex order
 };
 
+// Per-substep input. The collider owning triangles must outlive this input.
+// Vertex motion between the sampled endpoints is interpreted as linear for CCD.
+struct ColliderInput
+{
+    const std::vector<KinematicCollider::Triangle>& triangles;
+    ColliderStep step;
+};
+
 } // namespace diffxpbd

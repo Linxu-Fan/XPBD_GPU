@@ -16,6 +16,8 @@ int main(int argc, char* argv[])
 	parameters simParams;
 	material clothMaterial;
 	state simState;
+	// Configure this with obstacle topology and a prescribed world-space motion sampler.
+	std::optional<diffxpbd::KinematicCollider> collider;
 
 	// Step 1: read the mesh
 	const auto defaultMeshPath = std::filesystem::u8path(DIFFXPBD_DEFAULT_MESH_PATH);
@@ -59,7 +61,21 @@ int main(int argc, char* argv[])
 	        return 1;
 	    }
 
-		bool stepSuccess = advanceState(clothMesh, clothMaterial, simParams, simState);
+		std::optional<diffxpbd::ColliderInput> colliderInput;
+		if (collider) {
+		    const double startTime = i * timestep;
+		    const double endTime = (i + 1) * timestep;
+		    try {
+		        colliderInput.emplace(diffxpbd::ColliderInput{
+		            collider->triangles(), collider->sampleStep(startTime, endTime)});
+		    } catch (const std::exception& error) {
+		        std::cerr << "Failed to sample obstacle at timestep " << i
+		                  << ": " << error.what() << '\n';
+		        return 1;
+		    }
+		}
+		bool stepSuccess = advanceState(clothMesh, clothMaterial, simParams, simState,
+		                                colliderInput ? &*colliderInput : nullptr);
 		if (stepSuccess)
 		{
 			exportStateAsObj("output/skirt.obj", clothMesh, simState, i);

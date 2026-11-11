@@ -553,11 +553,37 @@ void calBendingConstraint_i(const std::vector<Eigen::Vector3d>& positions, const
     constraint_mass_matrix = masses.asDiagonal();
 }
 
-bool advanceState(const mesh& m, const material& mat, const parameters& params, state& s, const std::vector<Eigen::Vector3d>& collider_positions)
+bool advanceState(const mesh& m, const material& mat, const parameters& params, state& s,
+                  const diffxpbd::ColliderInput* collider)
 {
     const double dt2 = params.timestep * params.timestep;
     if (!(params.timestep > 0.0) || !std::isfinite(dt2) || dt2 <= 0.0) {
         return false;
+    }
+
+    if (collider) {
+        const auto& step = collider->step;
+        const double duration = step.end_time - step.start_time;
+        const double time_tolerance = 32.0 * std::numeric_limits<double>::epsilon() *
+            std::max({1.0, std::abs(step.start_time), std::abs(step.end_time), params.timestep});
+        if (!std::isfinite(step.start_time) || !std::isfinite(step.end_time) ||
+            !std::isfinite(duration) || duration <= 0.0 ||
+            std::abs(duration - params.timestep) > time_tolerance ||
+            collider->triangles.empty() || step.start_positions.size() < 3 ||
+            step.start_positions.size() != step.end_positions.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < step.start_positions.size(); ++i) {
+            if (!step.start_positions[i].allFinite() || !step.end_positions[i].allFinite()) {
+                return false;
+            }
+        }
+        for (const auto& [a, b, c] : collider->triangles) {
+            if (a >= step.start_positions.size() || b >= step.start_positions.size() ||
+                c >= step.start_positions.size() || a == b || a == c || b == c) {
+                return false;
+            }
+        }
     }
 
     // calculate external force
