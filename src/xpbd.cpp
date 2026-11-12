@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <tuple>
 
 // Forward position prediction, constraint projection, and velocity updates go here.
 
@@ -206,17 +207,23 @@ std::optional<double> signedDihedral(const std::vector<Eigen::Vector3d>& positio
 void exportStateAsObj(const std::filesystem::path& mesh_path, const mesh& m, const state& s,
                       std::size_t timestep)
 {
-    if (s.position.size() != m.vertices.size() || s.position.empty() || m.triangles.empty()) {
+    exportStateAsObj(mesh_path, m, s.position, timestep);
+}
+
+void exportStateAsObj(const std::filesystem::path& mesh_path, const mesh& m,
+                      const std::vector<Eigen::Vector3d>& positions, std::size_t timestep)
+{
+    if (positions.size() != m.vertices.size() || positions.empty() || m.triangles.empty()) {
         throw std::runtime_error("OBJ export requires simulated positions matching a triangle mesh");
     }
-    for (const auto& position : s.position) {
+    for (const auto& position : positions) {
         if (!position.allFinite()) {
             throw std::runtime_error("OBJ export encountered a nonfinite vertex position");
         }
     }
     for (const auto& triangle : m.triangles) {
         for (const auto index : triangle.indices) {
-            if (index >= s.position.size()) {
+            if (index >= positions.size()) {
                 throw std::runtime_error("OBJ export encountered an out-of-range vertex index");
             }
         }
@@ -235,7 +242,7 @@ void exportStateAsObj(const std::filesystem::path& mesh_path, const mesh& m, con
     }
     output.imbue(std::locale::classic());
     output << std::setprecision(std::numeric_limits<double>::max_digits10);
-    for (const auto& position : s.position) {
+    for (const auto& position : positions) {
         output << "v " << position.x() << ' ' << position.y() << ' ' << position.z() << '\n';
     }
     for (const auto& triangle : m.triangles) {
@@ -390,6 +397,9 @@ bool initializeState(const mesh& m, const material& mat, state& s)
 	s.velocity = std::move(velocity);
     s.multiplier_membrane = std::move(membrane_multipliers);
     s.multiplier_bending = std::move(bending_multipliers);
+    s.contacts.clear();
+    s.multiplier_contact.clear();
+    s.contact_substeps = 1;
     s.constraint_membrane = std::move(membrane_constraints);
     s.constraint_bending = std::move(bending_constraints);
     s.bending_hinges = std::move(bending_hinges);
@@ -553,38 +563,12 @@ void calBendingConstraint_i(const std::vector<Eigen::Vector3d>& positions, const
     constraint_mass_matrix = masses.asDiagonal();
 }
 
-bool advanceState(const mesh& m, const material& mat, const parameters& params, state& s,
-                  const diffxpbd::ColliderInput* collider)
+namespace {
+
+bool advanceStateOnce(const mesh& m, const material& mat, const parameters& params, state& s,
+                      const diffxpbd::ColliderInput* collider)
 {
     const double dt2 = params.timestep * params.timestep;
-    if (!(params.timestep > 0.0) || !std::isfinite(dt2) || dt2 <= 0.0) {
-        return false;
-    }
-
-    if (collider) {
-        const auto& step = collider->step;
-        const double duration = step.end_time - step.start_time;
-        const double time_tolerance = 32.0 * std::numeric_limits<double>::epsilon() *
-            std::max({1.0, std::abs(step.start_time), std::abs(step.end_time), params.timestep});
-        if (!std::isfinite(step.start_time) || !std::isfinite(step.end_time) ||
-            !std::isfinite(duration) || duration <= 0.0 ||
-            std::abs(duration - params.timestep) > time_tolerance ||
-            collider->triangles.empty() || step.start_positions.size() < 3 ||
-            step.start_positions.size() != step.end_positions.size()) {
-            return false;
-        }
-        for (std::size_t i = 0; i < step.start_positions.size(); ++i) {
-            if (!step.start_positions[i].allFinite() || !step.end_positions[i].allFinite()) {
-                return false;
-            }
-        }
-        for (const auto& [a, b, c] : collider->triangles) {
-            if (a >= step.start_positions.size() || b >= step.start_positions.size() ||
-                c >= step.start_positions.size() || a == b || a == c || b == c) {
-                return false;
-            }
-        }
-    }
 
     // calculate external force
     if (!calExternalForce(m, params, s)) {
@@ -621,6 +605,64 @@ bool advanceState(const mesh& m, const material& mat, const parameters& params, 
     std::fill(s.multiplier_membrane.begin(), s.multiplier_membrane.end(),
               Eigen::Vector3d::Zero());
     std::fill(s.multiplier_bending.begin(), s.multiplier_bending.end(), 0.0);
+    s.contacts.clear();
+    s.multiplier_contact.clear();
+    s.contact_substeps = 1;
+
+
+    using ContactKey = std::tuple<int, std::array<std::size_t, 3>,
+                                  int, std::array<std::size_t, 3>>;
+    std::map<ContactKey, std::size_t> contact_indices;
+    const auto refreshContacts = [&]() {
+        if (!collider) return;
+        auto detected = diffxpbd::detectMeshContacts(m, s.position,
+            s.position_predicted_during_iteration, *collider, params.contact, &s.contacts);
+        for (auto& contact : detected) {
+            const ContactKey key{static_cast<int>(contact.cloth.feature_type), contact.cloth.indices,
+                                 static_cast<int>(contact.obstacle.feature_type), contact.obstacle.indices};
+            if (contact_indices.emplace(key, s.contacts.size()).second) {
+                s.contacts.push_back(std::move(contact));
+                s.multiplier_contact.push_back(0.0);
+            }
+        }
+    };
+    // Keep the original impact side when the same pair is found after projection.
+    refreshContacts();
+    const auto projectContacts = [&]() {
+        if (!collider) return true;
+        refreshContacts();
+        const double alpha_tilde = params.contact.compliance / dt2;
+        for (std::size_t i = 0; i < s.contacts.size(); ++i) {
+            const auto& contact = s.contacts[i];
+            const auto evaluation = diffxpbd::evaluateContact(contact,
+                s.position_predicted_during_iteration, collider->step.end_positions,
+                params.contact.separation);
+            double inverse_effective_mass = 0.0;
+            std::array<Eigen::Vector3d, 3> directions;
+            for (std::size_t j = 0; j < contact.cloth.vertex_count(); ++j) {
+                const auto vertex = contact.cloth.indices[j];
+                directions[j].setZero();
+                if (!s.pinned_positions[vertex]) {
+                    directions[j] = evaluation.cloth_jacobian.row(j).transpose().cwiseQuotient(
+                        masses.segment<3>(3 * vertex));
+                    inverse_effective_mass += evaluation.cloth_jacobian.row(j).dot(directions[j]);
+                }
+            }
+            if (inverse_effective_mass == 0.0) continue;
+            double& multiplier = s.multiplier_contact[i];
+            const double increment = (-evaluation.gap - alpha_tilde * multiplier) /
+                                     (inverse_effective_mass + alpha_tilde);
+            const double next_multiplier = std::max(0.0, multiplier + increment);
+            if (!std::isfinite(increment) || !std::isfinite(next_multiplier)) return false;
+            for (std::size_t j = 0; j < contact.cloth.vertex_count(); ++j) {
+                auto& position = s.position_predicted_during_iteration[contact.cloth.indices[j]];
+                position += directions[j] * (next_multiplier - multiplier);
+                if (!position.allFinite()) return false;
+            }
+            multiplier = next_multiplier;
+        }
+        return true;
+    };
 
     // perform constraint projection per iteration
     if (!params.JacobiSolver) // Gauss-Seidel style projection
@@ -699,6 +741,10 @@ bool advanceState(const mesh& m, const material& mat, const parameters& params, 
                 s.position_predicted_during_iteration[hinge.opposite[1]] += delta_x.segment<3>(9);
             }
 
+            // Refresh and project cloth-obstacle mesh contacts
+            if (!projectContacts()) {
+                return false;
+            }
             iteration++;
         };
 
@@ -778,10 +824,36 @@ bool advanceState(const mesh& m, const material& mat, const parameters& params, 
                 s.position_predicted_during_iteration[hinge.opposite[1]] += delta_x.segment<3>(9);
             }
 
+            // Refresh and project cloth-obstacle mesh contacts
+            if (!projectContacts()) {
+                return false;
+            }
 			s.position_predicted_after_iteration = s.position_predicted_during_iteration;
 			iteration++;
         };
 
+    }
+
+
+    if (collider) {
+        for (int pass = 0; pass < params.contact.max_contact_passes; ++pass) {
+            const auto count = s.contacts.size();
+            if (!projectContacts()) return false;
+            if (s.contacts.size() == count) break;
+        }
+        s.position_predicted_after_iteration = s.position_predicted_during_iteration;
+
+        // Compliant separation can be slightly violated, but an actual crossing is rejected.
+        auto crossing_settings = params.contact;
+        crossing_settings.separation = 0.0;
+        const auto crossings = diffxpbd::detectMeshContacts(m, s.position,
+            s.position_predicted_during_iteration, *collider, crossing_settings);
+        for (const auto& contact : crossings) {
+            const double toi = *contact.time_of_impact;
+            const double final_gap = diffxpbd::evaluateContact(contact,
+                s.position_predicted_during_iteration, collider->step.end_positions, 0.0).gap;
+            if (toi > 1e-8 || final_gap < -params.contact.ccd_tolerance) return false;
+        }
     }
 
     const auto& projected_positions = params.JacobiSolver
@@ -797,4 +869,79 @@ bool advanceState(const mesh& m, const material& mat, const parameters& params, 
     s.position = projected_positions;
 
     return true;
+}
+
+} // namespace
+
+bool advanceState(const mesh& m, const material& mat, const parameters& params, state& s,
+                  const diffxpbd::ColliderInput* collider)
+{
+    const double dt2 = params.timestep * params.timestep;
+    if (!std::isfinite(dt2) || dt2 <= 0.0 || params.timestep <= 0.0) return false;
+    if (!collider) return advanceStateOnce(m, mat, params, s, nullptr);
+
+    const auto& settings = params.contact;
+    if (!std::isfinite(settings.separation) || settings.separation <= 0.0 ||
+        !std::isfinite(settings.compliance) || settings.compliance <= 0.0 ||
+        !std::isfinite(settings.compliance / dt2) ||
+        !std::isfinite(settings.ccd_tolerance) || settings.ccd_tolerance <= 0.0 ||
+        settings.max_contact_passes < 1 || settings.max_subdivisions < 0 ||
+        settings.max_subdivisions > 10 || params.totalIterations < 1) return false;
+
+    const auto& motion = collider->step;
+    const double duration = motion.end_time - motion.start_time;
+    const double time_tolerance = 32.0 * std::numeric_limits<double>::epsilon() *
+        std::max({1.0, std::abs(motion.start_time), std::abs(motion.end_time), params.timestep});
+    if (!std::isfinite(motion.start_time) || !std::isfinite(motion.end_time) ||
+        !std::isfinite(duration) || duration <= 0.0 ||
+        std::abs(duration - params.timestep) > time_tolerance ||
+        motion.start_positions.size() < 3 ||
+        motion.start_positions.size() != motion.end_positions.size() ||
+        collider->triangles.empty()) return false;
+    for (std::size_t i = 0; i < motion.start_positions.size(); ++i) {
+        if (!motion.start_positions[i].allFinite() || !motion.end_positions[i].allFinite()) return false;
+    }
+    for (const auto& triangle : collider->triangles) {
+        const auto [a, b, c] = triangle;
+        if (a >= motion.start_positions.size() || b >= motion.start_positions.size() ||
+            c >= motion.start_positions.size() || a == b || a == c || b == c) return false;
+        for (const auto* positions : {&motion.start_positions, &motion.end_positions}) {
+            if (((*positions)[b] - (*positions)[a]).cross((*positions)[c] - (*positions)[a]).squaredNorm()
+                <= 1e-24) return false;
+        }
+    }
+
+    // Each attempt is transactional. Failed trials never change the caller's state.
+    for (int level = 0; level <= settings.max_subdivisions; ++level) {
+        const int count = 1 << level;
+        state trial = s;
+        parameters substep_params = params;
+        substep_params.timestep = params.timestep / count;
+        bool success = true;
+        for (int substep = 0; substep < count; ++substep) {
+            const double begin = static_cast<double>(substep) / count;
+            const double end = static_cast<double>(substep + 1) / count;
+            diffxpbd::ColliderStep sampled{
+                motion.start_time + begin * duration, motion.start_time + end * duration, {}, {}};
+            for (std::size_t i = 0; i < motion.start_positions.size(); ++i) {
+                sampled.start_positions.push_back((1.0 - begin) * motion.start_positions[i] +
+                                                  begin * motion.end_positions[i]);
+                sampled.end_positions.push_back((1.0 - end) * motion.start_positions[i] +
+                                                end * motion.end_positions[i]);
+            }
+            diffxpbd::ColliderInput input{collider->triangles, std::move(sampled)};
+            try {
+                success = advanceStateOnce(m, mat, substep_params, trial, &input);
+            } catch (const std::runtime_error&) {
+                success = false;
+            }
+            if (!success) break;
+        }
+        if (success) {
+            trial.contact_substeps = count;
+            s = std::move(trial);
+            return true;
+        }
+    }
+    return false;
 }

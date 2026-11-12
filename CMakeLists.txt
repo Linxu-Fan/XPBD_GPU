@@ -17,6 +17,18 @@ if(NOT Eigen3_FOUND)
     FetchContent_MakeAvailable(eigen)
 endif()
 
+include(FetchContent)
+set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(spdlog
+    URL https://github.com/gabime/spdlog/archive/refs/tags/v1.15.3.tar.gz
+    URL_HASH SHA256=15a04e69c222eb6c01094b5c7ff8a249b36bb22788d72519646fb85feb267e67
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(spdlog)
+set(TIGHT_INCLUSION_WITH_DOUBLE_PRECISION ON CACHE BOOL "Use double precision CCD inputs" FORCE)
+add_subdirectory(third_party/tight-inclusion EXCLUDE_FROM_ALL)
+
 if(DIFFXPBD_ENABLE_CUDA)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CMAKE_CUDA_ARCHITECTURES native)
@@ -28,6 +40,7 @@ add_library(diffxpbd_core STATIC
     src/build_info.cpp
     src/xpbd.cpp
     src/kinematic_collider.cpp
+    src/contact.cpp
     src/linearization.cpp
     src/adjoint.cpp
 )
@@ -43,15 +56,19 @@ target_sources(diffxpbd_core
         include/diffxpbd/linearization.hpp
         include/diffxpbd/adjoint.hpp
 )
-target_link_libraries(diffxpbd_core PUBLIC Eigen3::Eigen)
+target_link_libraries(diffxpbd_core PUBLIC Eigen3::Eigen PRIVATE tight_inclusion::tight_inclusion)
 target_compile_features(diffxpbd_core PUBLIC cxx_std_17)
 
-add_executable(diffxpbd src/main.cpp)
-target_compile_definitions(diffxpbd PRIVATE
-    DIFFXPBD_DEFAULT_MESH_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/remeshed/skirt1252.obj"
-)
-target_link_libraries(diffxpbd PRIVATE DiffXPBD::core)
+if(NOT WIN32)
+    message(FATAL_ERROR "The simulator's OpenGL viewer currently requires Windows")
+endif()
+add_executable(diffxpbd src/main.cpp src/viewer.cpp include/diffxpbd/viewer.hpp)
+target_link_libraries(diffxpbd PRIVATE DiffXPBD::core opengl32 gdi32 user32)
 set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT diffxpbd)
+set_target_properties(diffxpbd PROPERTIES
+    VS_DEBUGGER_COMMAND_ARGUMENTS ""
+    VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
 set_target_properties(diffxpbd diffxpbd_core PROPERTIES CXX_EXTENSIONS OFF)
 if(MSVC)
     target_compile_options(diffxpbd_core PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
@@ -60,7 +77,13 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-    add_test(NAME scaffold_startup COMMAND diffxpbd)
+    add_executable(mesh_contact_test tests/mesh_contact.cpp)
+    target_link_libraries(mesh_contact_test PRIVATE DiffXPBD::core)
+    if(MSVC)
+        target_compile_options(mesh_contact_test PRIVATE /utf-8)
+    endif()
+    add_test(NAME mesh_contact COMMAND mesh_contact_test)
+    set_tests_properties(mesh_contact PROPERTIES TIMEOUT 120)
 endif()
 
 if(DIFFXPBD_ENABLE_CUDA)

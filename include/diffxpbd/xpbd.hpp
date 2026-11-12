@@ -1,4 +1,5 @@
 #pragma once
+#include "diffxpbd/contact.hpp"
 #include "diffxpbd/kinematic_collider.hpp"
 #include <array>
 #include <cstddef>
@@ -53,11 +54,12 @@ struct mesh
 // simulation parameters
 struct parameters
 {
-	double timestep = 0.0025;
+	double timestep = 0.01;
 	int totalSteps = 4000; // total simulation timesteps
-	int totalIterations = 25; // maximum simulation iterations
+	int totalIterations = 50; // maximum simulation iterations
 	Eigen::Vector3d gravity = {0.0, -9.8, 0.0};
 	bool JacobiSolver = false;
+    diffxpbd::ContactSettings contact;
 };
 
 // material properties for simulation
@@ -102,6 +104,9 @@ struct state
 
 	std::vector<Eigen::Vector3d> multiplier_membrane;
 	std::vector<double> multiplier_bending; // one scalar per bending hinge
+    std::vector<diffxpbd::Contact> contacts; // active feature geometry of the last internal substep
+    std::vector<double> multiplier_contact; // one nonnegative multiplier per contact
+    int contact_substeps = 1; // accepted internal substep count, for replay
 
 	std::vector<Eigen::Vector3d> constraint_membrane;
 	std::vector<double> constraint_bending;
@@ -127,6 +132,10 @@ void importAnMesh(const std::filesystem::path& mesh_path, mesh& m);
 // Throws std::runtime_error on invalid geometry or output failure.
 void exportStateAsObj(const std::filesystem::path& mesh_path, const mesh& m, const state& s,
                       std::size_t timestep);
+
+// Export prescribed geometry using the same timestep naming and validation.
+void exportStateAsObj(const std::filesystem::path& mesh_path, const mesh& m,
+                      const std::vector<Eigen::Vector3d>& positions, std::size_t timestep);
 
 
 // Initialize rest data, lumped masses, and unscaled compliances.
@@ -160,6 +169,8 @@ void calBendingConstraint_i(const std::vector<Eigen::Vector3d>& positions, const
 // one step forward simulation of the mesh state using XPBD, with optional kinematic collider.
 // Collider input is borrowed for this call and remains outside the dynamic state.
 // Returns false if the supplied collider geometry or substep duration is invalid.
+// Mesh contact is frictionless and preserves pins. Endpoint motion is piecewise linear.
+// Collider calls commit state only after successful contact validation and bounded retries.
 bool advanceState(const mesh& m, const material& mat, const parameters& params, state& s,
                   const diffxpbd::ColliderInput* collider = nullptr);
 
