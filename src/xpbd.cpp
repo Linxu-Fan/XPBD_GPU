@@ -255,15 +255,13 @@ void exportStateAsObj(const std::filesystem::path& mesh_path, const mesh& m,
     }
 }
 
-bool initializeState(const mesh& m, const material& mat, state& s)
+bool initializeState(mesh& m, const material& mat, state& s)
 {
     diffxpbd::Mat33 membrane_stiffness;
     membrane_stiffness << mat.C00, mat.C01, 0.0,
                           mat.C01, mat.C11, 0.0,
                           0.0,     0.0,     mat.C22;
-    if (!membrane_stiffness.allFinite()) {
-        return false;
-    }
+
     const Eigen::LLT<diffxpbd::Mat33> stiffness_factorization(membrane_stiffness);
     if (stiffness_factorization.info() != Eigen::Success) {
         return false;
@@ -402,11 +400,11 @@ bool initializeState(const mesh& m, const material& mat, state& s)
     s.contact_substeps = 1;
     s.constraint_membrane = std::move(membrane_constraints);
     s.constraint_bending = std::move(bending_constraints);
-    s.bending_hinges = std::move(bending_hinges);
+    m.bending_hinges = std::move(bending_hinges);
     s.compliance_membrane = std::move(membrane_compliance);
     s.compliance_bending = std::move(bending_compliance);
-    s.indices_membrane = std::move(membrane_indices);
-    s.indices_bending = std::move(bending_indices);
+    m.indices_membrane = std::move(membrane_indices);
+    m.indices_bending = std::move(bending_indices);
     return true;
 }
 
@@ -414,15 +412,10 @@ bool calExternalForce(const mesh& m, const parameters& params, state& s)
 {
     const auto vertex_count = static_cast<Eigen::Index>(m.vertices.size());
     const Eigen::Index dof_count = 3 * vertex_count;
-    if (s.M.rows() != dof_count || s.M.cols() != dof_count ||
-        !params.gravity.allFinite()) {
-        return false;
-    }
+
 
     const auto masses = s.M.diagonal();
-    if (!masses.allFinite() || (masses.array() < 0.0).any()) {
-        return false;
-    }
+
 
     s.f_ext.resize(m.vertices.size());
     for (Eigen::Index vertex = 0; vertex < vertex_count; ++vertex) {
@@ -461,9 +454,7 @@ diffxpbd::Mat32 membraneDeformationGradient(const std::vector<Eigen::Vector3d>& 
                                              const diffxpbd::Mat22& rest_inverse)
 {
     const auto [a, b, c] = vertices;
-    if (a >= positions.size() || b >= positions.size() || c >= positions.size()) {
-        throw std::invalid_argument("Membrane triangle vertex index out of range");
-    }
+
 
     diffxpbd::Mat32 Ds;
     Ds.col(0) = positions[b] - positions[a];
@@ -475,29 +466,21 @@ Eigen::Vector3d membraneStrain(const diffxpbd::Mat32& F)
 {
     const diffxpbd::Mat22 E = 0.5 * (F.transpose() * F - diffxpbd::Mat22::Identity());
     const Eigen::Vector3d constraint(E(0, 0), E(1, 1), 2.0 * E(0, 1));
-    if (!constraint.allFinite()) {
-        throw std::invalid_argument("Nonfinite membrane strain");
-    }
+
     return constraint;
 }
 
 } // namespace
 
 
-void calMembraneConstraint_i(const std::vector<Eigen::Vector3d>& positions, const state& s,
+void calMembraneConstraint_i(const std::vector<Eigen::Vector3d>& positions, const mesh& m, const state& s,
                              int index, Eigen::Vector3d& constraint,
                              diffxpbd::Mat39& constraint_derivatives,
                              diffxpbd::Mat99& constraint_mass_matrix)
 {
-    if (index < 0 || static_cast<std::size_t>(index) >= s.indices_membrane.size()) {
-        throw std::out_of_range("Membrane triangle index out of range");
-    }
-    if (s.Dm_inv.size() != s.indices_membrane.size()) {
-        throw std::invalid_argument("Membrane constraint requires initialized rest data");
-    }
 
     const auto triangle_index = static_cast<std::size_t>(index);
-    const auto& dofs = s.indices_membrane[triangle_index];
+    const auto& dofs = m.indices_membrane[triangle_index];
     std::array<std::size_t, 3> vertices;
     for (std::size_t local = 0; local < vertices.size(); ++local) {
         const auto first_dof = dofs[static_cast<Eigen::Index>(3 * local)];
@@ -538,21 +521,15 @@ void calMembraneConstraint_i(const std::vector<Eigen::Vector3d>& positions, cons
 }
 
 
-void calBendingConstraint_i(const std::vector<Eigen::Vector3d>& positions, const state& s,
+void calBendingConstraint_i(const std::vector<Eigen::Vector3d>& positions, const mesh& m, const state& s,
                             int index, double& constraint,
                             diffxpbd::Mat112& constraint_derivatives,
                             diffxpbd::Mat1212& constraint_mass_matrix)
 {
-    if (index < 0 || static_cast<std::size_t>(index) >= s.bending_hinges.size()) {
-        throw std::out_of_range("Bending hinge index out of range");
-    }
 
-    const auto& hinge = s.bending_hinges[static_cast<std::size_t>(index)];
+    const auto& hinge = m.bending_hinges[static_cast<std::size_t>(index)];
     diffxpbd::Mat112 jacobian;
     const auto angle = signedDihedral(positions, hinge, &jacobian);
-    if (!angle || !std::isfinite(hinge.rest_angle)) {
-        throw std::invalid_argument("Invalid geometry or rest angle for bending hinge");
-    }
 
     const std::array<std::size_t, 4> vertices{
         hinge.edge[0], hinge.edge[1], hinge.opposite[0], hinge.opposite[1]};
@@ -565,6 +542,13 @@ void calBendingConstraint_i(const std::vector<Eigen::Vector3d>& positions, const
 
 namespace {
 
+/*
+    The contact is refreshed every sweep. The contact detected earlier is kept in later sweeps.
+	a) if the contact is still active, the multiplier is kept and updated.
+	b) if the contact is no longer active, the multiplier becomes 0.
+	c) if a new contact is detected, the multiplier is initialized to 0.
+    d) 
+*/
 bool advanceStateOnce(const mesh& m, const material& mat, const parameters& params, state& s,
                       const diffxpbd::ColliderInput* collider)
 {
@@ -676,12 +660,12 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
                 Eigen::Vector3d constraint = Eigen::Vector3d::Zero();
                 diffxpbd::Mat39 constraint_derivatives = diffxpbd::Mat39::Zero();
                 diffxpbd::Mat99 constraint_mass_matrix = diffxpbd::Mat99::Zero();
-                calMembraneConstraint_i(s.position_predicted_during_iteration, s, i,
+                calMembraneConstraint_i(s.position_predicted_during_iteration, m, s, i,
                                         constraint, constraint_derivatives, constraint_mass_matrix);
 
                 const diffxpbd::Mat33 alpha_tilde = s.compliance_membrane[i] / dt2;
                 diffxpbd::Vec9d inv_mass = constraint_mass_matrix.diagonal().cwiseInverse();
-                maskPinnedInverseMasses(inv_mass, s.indices_membrane[i]);
+                maskPinnedInverseMasses(inv_mass, m.indices_membrane[i]);
                 const auto& J = constraint_derivatives;
                 const diffxpbd::Mat33 lhs = J * inv_mass.asDiagonal() * J.transpose() + alpha_tilde;
                 const Eigen::Vector3d rhs =
@@ -714,12 +698,12 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
                 double constraint = 0.0;
                 diffxpbd::Mat112 constraint_derivatives = diffxpbd::Mat112::Zero();
                 diffxpbd::Mat1212 constraint_mass_matrix = diffxpbd::Mat1212::Zero();
-                calBendingConstraint_i(s.position_predicted_during_iteration, s, i,
+                calBendingConstraint_i(s.position_predicted_during_iteration, m, s, i,
                     constraint, constraint_derivatives, constraint_mass_matrix);
 
                 const double alpha_tilde = s.compliance_bending[i] / dt2;
                 diffxpbd::Vecd<12> inv_mass = constraint_mass_matrix.diagonal().cwiseInverse();
-                maskPinnedInverseMasses(inv_mass, s.indices_bending[i]);
+                maskPinnedInverseMasses(inv_mass, m.indices_bending[i]);
                 const auto& J = constraint_derivatives;
                 const double denominator =
                     (J * inv_mass.asDiagonal() * J.transpose())(0, 0) + alpha_tilde;
@@ -734,7 +718,7 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
                     return false;
                 }
                 s.multiplier_bending[i] += delta_multiplier;
-                const auto& hinge = s.bending_hinges[i];
+                const auto& hinge = m.bending_hinges[i];
                 s.position_predicted_during_iteration[hinge.edge[0]] += delta_x.segment<3>(0);
                 s.position_predicted_during_iteration[hinge.edge[1]] += delta_x.segment<3>(3);
                 s.position_predicted_during_iteration[hinge.opposite[0]] += delta_x.segment<3>(6);
@@ -760,12 +744,12 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
                 Eigen::Vector3d constraint = Eigen::Vector3d::Zero();
                 diffxpbd::Mat39 constraint_derivatives = diffxpbd::Mat39::Zero();
                 diffxpbd::Mat99 constraint_mass_matrix = diffxpbd::Mat99::Zero();
-                calMembraneConstraint_i(s.position_predicted_after_iteration, s, i,
+                calMembraneConstraint_i(s.position_predicted_after_iteration, m, s, i,
                     constraint, constraint_derivatives, constraint_mass_matrix);
 
                 const diffxpbd::Mat33 alpha_tilde = s.compliance_membrane[i] / dt2;
                 diffxpbd::Vec9d inv_mass = constraint_mass_matrix.diagonal().cwiseInverse();
-                maskPinnedInverseMasses(inv_mass, s.indices_membrane[i]);
+                maskPinnedInverseMasses(inv_mass, m.indices_membrane[i]);
                 const auto& J = constraint_derivatives;
                 const diffxpbd::Mat33 lhs = J * inv_mass.asDiagonal() * J.transpose() + alpha_tilde;
                 const Eigen::Vector3d rhs =
@@ -797,12 +781,12 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
                 double constraint = 0.0;
                 diffxpbd::Mat112 constraint_derivatives = diffxpbd::Mat112::Zero();
                 diffxpbd::Mat1212 constraint_mass_matrix = diffxpbd::Mat1212::Zero();
-                calBendingConstraint_i(s.position_predicted_after_iteration, s, i,
+                calBendingConstraint_i(s.position_predicted_after_iteration, m, s, i,
                     constraint, constraint_derivatives, constraint_mass_matrix);
 
                 const double alpha_tilde = s.compliance_bending[i] / dt2;
                 diffxpbd::Vecd<12> inv_mass = constraint_mass_matrix.diagonal().cwiseInverse();
-                maskPinnedInverseMasses(inv_mass, s.indices_bending[i]);
+                maskPinnedInverseMasses(inv_mass, m.indices_bending[i]);
                 const auto& J = constraint_derivatives;
                 const double denominator =
                     (J * inv_mass.asDiagonal() * J.transpose())(0, 0) + alpha_tilde;
@@ -817,7 +801,7 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
                     return false;
                 }
                 s.multiplier_bending[i] += delta_multiplier;
-                const auto& hinge = s.bending_hinges[i];
+                const auto& hinge = m.bending_hinges[i];
                 s.position_predicted_during_iteration[hinge.edge[0]] += delta_x.segment<3>(0);
                 s.position_predicted_during_iteration[hinge.edge[1]] += delta_x.segment<3>(3);
                 s.position_predicted_during_iteration[hinge.opposite[0]] += delta_x.segment<3>(6);
@@ -836,7 +820,7 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
 
 
     if (collider) {
-        for (int pass = 0; pass < params.contact.max_contact_passes; ++pass) {
+        for (int pass = 0; pass < params.contact.max_extra_contact_sweeps; ++pass) {
             const auto count = s.contacts.size();
             if (!projectContacts()) return false;
             if (s.contacts.size() == count) break;
@@ -877,42 +861,28 @@ bool advanceState(const mesh& m, const material& mat, const parameters& params, 
                   const diffxpbd::ColliderInput* collider)
 {
     const double dt2 = params.timestep * params.timestep;
-    if (!std::isfinite(dt2) || dt2 <= 0.0 || params.timestep <= 0.0) return false;
     if (!collider) return advanceStateOnce(m, mat, params, s, nullptr);
 
     const auto& settings = params.contact;
-    if (!std::isfinite(settings.separation) || settings.separation <= 0.0 ||
-        !std::isfinite(settings.compliance) || settings.compliance <= 0.0 ||
-        !std::isfinite(settings.compliance / dt2) ||
-        !std::isfinite(settings.ccd_tolerance) || settings.ccd_tolerance <= 0.0 ||
-        settings.max_contact_passes < 1 || settings.max_subdivisions < 0 ||
-        settings.max_subdivisions > 10 || params.totalIterations < 1) return false;
-
     const auto& motion = collider->step;
     const double duration = motion.end_time - motion.start_time;
     const double time_tolerance = 32.0 * std::numeric_limits<double>::epsilon() *
         std::max({1.0, std::abs(motion.start_time), std::abs(motion.end_time), params.timestep});
-    if (!std::isfinite(motion.start_time) || !std::isfinite(motion.end_time) ||
-        !std::isfinite(duration) || duration <= 0.0 ||
-        std::abs(duration - params.timestep) > time_tolerance ||
-        motion.start_positions.size() < 3 ||
-        motion.start_positions.size() != motion.end_positions.size() ||
-        collider->triangles.empty()) return false;
-    for (std::size_t i = 0; i < motion.start_positions.size(); ++i) {
-        if (!motion.start_positions[i].allFinite() || !motion.end_positions[i].allFinite()) return false;
-    }
-    for (const auto& triangle : collider->triangles) {
-        const auto [a, b, c] = triangle;
-        if (a >= motion.start_positions.size() || b >= motion.start_positions.size() ||
-            c >= motion.start_positions.size() || a == b || a == c || b == c) return false;
-        for (const auto* positions : {&motion.start_positions, &motion.end_positions}) {
-            if (((*positions)[b] - (*positions)[a]).cross((*positions)[c] - (*positions)[a]).squaredNorm()
-                <= 1e-24) return false;
-        }
-    }
+    //for (std::size_t i = 0; i < motion.start_positions.size(); ++i) {
+    //    if (!motion.start_positions[i].allFinite() || !motion.end_positions[i].allFinite()) return false;
+    //}
+    //for (const auto& triangle : collider->triangles) {
+    //    const auto [a, b, c] = triangle;
+    //    if (a >= motion.start_positions.size() || b >= motion.start_positions.size() ||
+    //        c >= motion.start_positions.size() || a == b || a == c || b == c) return false;
+    //    for (const auto* positions : {&motion.start_positions, &motion.end_positions}) {
+    //        if (((*positions)[b] - (*positions)[a]).cross((*positions)[c] - (*positions)[a]).squaredNorm()
+    //            <= 1e-24) return false;
+    //    }
+    //}
 
     // Each attempt is transactional. Failed trials never change the caller's state.
-    for (int level = 0; level <= settings.max_subdivisions; ++level) {
+    for (int level = 0; level <= settings.max_extra_contact_step_levels; ++level) {
         const int count = 1 << level;
         state trial = s;
         parameters substep_params = params;

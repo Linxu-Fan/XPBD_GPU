@@ -17,8 +17,8 @@ struct ContactSettings
     double separation = 0.001; // m, minimum desired cloth-obstacle distance
     double compliance = 1e-7; // m/N
     double ccd_tolerance = 1e-7; // m
-    int max_contact_passes = 4;
-    int max_subdivisions = 4; // at most 2^max_subdivisions internal substeps
+    int max_extra_contact_sweeps = 4; // these are additional contact-only sweeps after the main solver finishes
+    int max_extra_contact_step_levels = 4; // at most 2^max_extra_contact_step_levels internal substeps
 };
 
 enum class ContactFeatureType {
@@ -54,13 +54,16 @@ struct Contact
 
 struct ContactEvaluation
 {
+    // g = n^T(p_{cloth} - p_{obstacle}) - d.
     double gap;
     // Row i is the derivative with respect to the corresponding feature vertex.
+    // Only the first 1, 2, or 3 rows are used for a vertex, edge, or triangle feature respectively. Remaining rows are zero.
     Eigen::Matrix3d cloth_jacobian = Eigen::Matrix3d::Zero();
     Eigen::Matrix3d obstacle_jacobian = Eigen::Matrix3d::Zero();
 };
 
 // Features, weights and normal are fixed when evaluating these local derivatives.
+// It takes an existing contact and evaluates its gap and position derivatives using the supplied current positions.
 ContactEvaluation evaluateContact(const Contact& contact,
     const std::vector<Eigen::Vector3d>& cloth_positions,
     const std::vector<Eigen::Vector3d>& obstacle_positions, double separation);
