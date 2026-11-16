@@ -16,6 +16,10 @@ public:
 
     bool pollEvents();
     bool shouldAdvance();
+    // Window-thread-only controls consumed by the simulation command channel.
+    bool isPaused() const;
+    bool takeSingleStep();
+    bool needsRedraw() const;
     void draw(const mesh& m, const state& s, int step, double time, bool finished,
               const ColliderInput* collider = nullptr);
 

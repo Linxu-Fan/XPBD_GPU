@@ -121,6 +121,8 @@ struct state
     std::vector<diffxpbd::Contact> contacts; // K Contact records; active feature geometry of the last internal substep
     std::vector<double> multiplier_contact; // K scalar entries; nonnegative contact multipliers
     int contact_substeps = 1; // one integer; accepted internal substep count, for replay
+    bool contact_reference_fallback = false; // one boolean; accepted step used full-search fallback
+
 
 };
 
@@ -174,7 +176,7 @@ void calBendingConstraint_i(const std::vector<Eigen::Vector3d>& positions, const
 // Collider input is borrowed for this call and remains outside the dynamic state.
 // Returns false if the supplied collider geometry or substep duration is invalid.
 // Mesh contact is frictionless and preserves pins. Endpoint motion is piecewise linear.
-// Collider calls commit state only after successful contact validation and bounded retries.
+// Obstacle and enabled self-contact calls commit only after validation and bounded retries.
 bool advanceState(const mesh& m, const material& mat, const parameters& params, state& s,
                   const diffxpbd::ColliderInput* collider = nullptr);
 

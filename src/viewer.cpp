@@ -23,6 +23,7 @@ struct Viewer::Impl
     HDC device = nullptr;
     HGLRC context = nullptr;
     bool closing = false;
+    bool redraw = true;
     bool paused = false;
     bool single_step = false;
     bool wireframe = true;
@@ -45,6 +46,21 @@ struct Viewer::Impl
             SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
         }
         if (self) {
+            // Repaint requests use the last immutable physics snapshot. Validate
+            // WM_PAINT here to avoid a busy loop of unhandled paint messages.
+            if (message == WM_PAINT) {
+                PAINTSTRUCT paint;
+                BeginPaint(window, &paint);
+                EndPaint(window, &paint);
+                self->redraw = true;
+                return 0;
+            }
+            if (message == WM_SIZE || message == WM_MOUSEWHEEL ||
+                message == WM_KEYDOWN ||
+                (message == WM_MOUSEMOVE && self->drag_mode != DragMode::None)) {
+                self->redraw = true;
+            }
+
             if (message == WM_LBUTTONDOWN || message == WM_MBUTTONDOWN || message == WM_RBUTTONDOWN) {
                 self->drag_mode = message == WM_LBUTTONDOWN ? DragMode::Orbit : DragMode::Pan;
                 self->mouse_x = GET_X_LPARAM(data);
@@ -207,6 +223,23 @@ bool Viewer::shouldAdvance()
     return advance;
 }
 
+bool Viewer::isPaused() const
+{
+    return impl_->paused;
+}
+
+bool Viewer::takeSingleStep()
+{
+    const bool requested = impl_->single_step;
+    impl_->single_step = false;
+    return requested;
+}
+
+bool Viewer::needsRedraw() const
+{
+    return impl_->redraw;
+}
+
 void Viewer::draw(const mesh& m, const state& s, int step, double time, bool finished,
                   const ColliderInput* collider)
 {
@@ -215,8 +248,10 @@ void Viewer::draw(const mesh& m, const state& s, int step, double time, bool fin
     const int width = bounds.right;
     const int height = bounds.bottom;
     if (width <= 0 || height <= 0) {
+        impl_->redraw = false;
         return;
     }
+    impl_->redraw = false;
     glViewport(0, 0, width, height);
     glClearColor(0.91f, 0.93f, 0.96f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
