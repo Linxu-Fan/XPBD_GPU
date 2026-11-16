@@ -20,8 +20,7 @@ public:
     bool isPaused() const;
     bool takeSingleStep();
     bool needsRedraw() const;
-    void draw(const mesh& m, const state& s, int step, double time, bool finished,
-              const ColliderInput* collider = nullptr);
+    void draw(const mesh& m, const state& s, int step, double time, bool finished);
 
 private:
     struct Impl;

@@ -1,6 +1,5 @@
 #pragma once
 #include "diffxpbd/contact.hpp"
-#include "diffxpbd/kinematic_collider.hpp"
 #include <array>
 #include <cstddef>
 #include <iostream>
@@ -121,7 +120,6 @@ struct state
     std::vector<diffxpbd::Contact> contacts; // K Contact records; active feature geometry of the last internal substep
     std::vector<double> multiplier_contact; // K scalar entries; nonnegative contact multipliers
     int contact_substeps = 1; // one integer; accepted internal substep count, for replay
-    bool contact_reference_fallback = false; // one boolean; accepted step used full-search fallback
 
 
 };
@@ -139,11 +137,6 @@ void importAnMesh(const std::filesystem::path& mesh_path, mesh& m);
 void exportStateAsObj(const std::filesystem::path& mesh_path, const mesh& m, const state& s,
                       std::size_t timestep);
 
-// Export prescribed geometry using the same timestep naming and validation.
-void exportStateAsObj(const std::filesystem::path& mesh_path, const mesh& m,
-                      const std::vector<Eigen::Vector3d>& positions, std::size_t timestep);
-
-
 // Initialize mesh topology caches, state rest data, lumped masses, and unscaled compliances.
 // Returns false for invalid geometry or invalid material parameters.
 bool initializeState(mesh& m, const material& mat, state& s);
@@ -153,6 +146,7 @@ bool initializeState(mesh& m, const material& mat, state& s);
 bool calExternalForce(const mesh& m, const parameters& params, state& s);
 
 
+// Constraint evaluators require a successfully initialized mesh/state and valid indices.
 // Evaluate one triangle's strain and its 3x9 position Jacobian.
 // Jacobian columns and the local lumped mass matrix are ordered x/y/z per vertex.
 // Uses the supplied full mesh position buffer, mesh topology, and cached rest data.
@@ -172,12 +166,9 @@ void calBendingConstraint_i(const std::vector<Eigen::Vector3d>& positions, const
                             diffxpbd::Mat1212& constraint_mass_matrix);
 
 
-// one step forward simulation of the mesh state using XPBD, with optional kinematic collider.
-// Collider input is borrowed for this call and remains outside the dynamic state.
-// Returns false if the supplied collider geometry or substep duration is invalid.
-// Mesh contact is frictionless and preserves pins. Endpoint motion is piecewise linear.
-// Obstacle and enabled self-contact calls commit only after validation and bounded retries.
-bool advanceState(const mesh& m, const material& mat, const parameters& params, state& s,
-                  const diffxpbd::ColliderInput* collider = nullptr);
-
-
+// Requires initialized mesh/state, matching position buffers and finite settings.
+// Contact separation must be nonnegative and CCD tolerance must be positive.
+// Advance one timestep with membrane, bending and optional cloth self-contact.
+// Self-contact is frictionless and preserves pins. Full swept validation and
+// bounded substep retries commit the state only after a successful attempt.
+bool advanceState(const mesh& m, const material& mat, const parameters& params, state& s);

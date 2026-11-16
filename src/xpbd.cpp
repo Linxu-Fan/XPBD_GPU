@@ -155,11 +155,6 @@ std::optional<double> signedDihedral(const std::vector<Eigen::Vector3d>& positio
 {
     const auto [a, b] = hinge.edge;
     const auto [c, d] = hinge.opposite;
-    if (a >= positions.size() || b >= positions.size() ||
-        c >= positions.size() || d >= positions.size()) {
-        return std::nullopt;
-    }
-
     const Eigen::Vector3d ab = positions[b] - positions[a];
     const Eigen::Vector3d ac = positions[c] - positions[a];
     const Eigen::Vector3d ad = positions[d] - positions[a];
@@ -179,12 +174,6 @@ std::optional<double> signedDihedral(const std::vector<Eigen::Vector3d>& positio
         const double edge_length = ab.stableNorm();
         const double first_height = ac.stableNorm() * first_length;
         const double second_height = ad.stableNorm() * second_length;
-        if (!std::isfinite(edge_length) || edge_length <= 0.0 ||
-            !std::isfinite(first_height) || first_height <= 0.0 ||
-            !std::isfinite(second_height) || second_height <= 0.0) {
-            return std::nullopt;
-        }
-
         const Eigen::Vector3d dc = -first_normal / first_height;
         const Eigen::Vector3d dd = -second_normal / second_height;
         // The projections along the edge determine how its endpoints share the gradient.
@@ -194,9 +183,6 @@ std::optional<double> signedDihedral(const std::vector<Eigen::Vector3d>& positio
         derivatives->segment<3>(3) = (-tc * dc - td * dd).transpose();
         derivatives->segment<3>(6) = dc.transpose();
         derivatives->segment<3>(9) = dd.transpose();
-        if (!derivatives->allFinite()) {
-            return std::nullopt;
-        }
     }
     return std::atan2(edge.dot(first_normal.cross(second_normal)),
                       first_normal.dot(second_normal));
@@ -207,30 +193,9 @@ std::optional<double> signedDihedral(const std::vector<Eigen::Vector3d>& positio
 void exportStateAsObj(const std::filesystem::path& mesh_path, const mesh& m, const state& s,
                       std::size_t timestep)
 {
-    exportStateAsObj(mesh_path, m, s.position, timestep);
-}
-
-void exportStateAsObj(const std::filesystem::path& mesh_path, const mesh& m,
-                      const std::vector<Eigen::Vector3d>& positions, std::size_t timestep)
-{
+    const auto& positions = s.position;
     if (positions.size() != m.vertices.size() || positions.empty() || m.triangles.empty()) {
         throw std::runtime_error("OBJ export requires simulated positions matching a triangle mesh");
-    }
-    for (const auto& position : positions) {
-        if (!position.allFinite()) {
-            throw std::runtime_error("OBJ export encountered a nonfinite vertex position");
-        }
-    }
-    for (const auto& triangle : m.triangles) {
-        for (const auto index : triangle.indices) {
-            if (index >= positions.size()) {
-                throw std::runtime_error("OBJ export encountered an out-of-range vertex index");
-            }
-        }
-    }
-
-    if (!mesh_path.has_filename() || mesh_path.filename() == "." || mesh_path.filename() == "..") {
-        throw std::runtime_error("OBJ export requires an output filename");
     }
     auto filename = mesh_path.stem();
     filename += "_" + std::to_string(timestep);
@@ -309,9 +274,6 @@ bool initializeState(mesh& m, const material& mat, state& s)
         }
 
         const diffxpbd::Mat33 compliance = material_compliance / area;
-        if (!compliance.allFinite() || (compliance.diagonal().array() <= 0.0).any()) {
-            return false;
-        }
         membrane_compliance.push_back(compliance);
 
         diffxpbd::Mat22 Dm;
@@ -322,9 +284,6 @@ bool initializeState(mesh& m, const material& mat, state& s)
             return false;
         }
         const diffxpbd::Mat22 inverse = Dm.inverse();
-        if (!inverse.allFinite()) {
-            return false;
-        }
         rest_inverses.push_back(inverse);
         membrane_indices.push_back(positionDofIndices(triangle.indices));
 
@@ -398,7 +357,6 @@ bool initializeState(mesh& m, const material& mat, state& s)
     s.contacts.clear();
     s.multiplier_contact.clear();
     s.contact_substeps = 1;
-    s.contact_reference_fallback = false;
     s.constraint_membrane = std::move(membrane_constraints);
     s.constraint_bending = std::move(bending_constraints);
     m.bending_hinges = std::move(bending_hinges);
@@ -430,22 +388,14 @@ namespace {
 
 template <std::size_t N>
 diffxpbd::Vecd<static_cast<int>(3 * N)> localMassDiagonal(
-    const Eigen::MatrixXd& mass_matrix, std::size_t vertex_count,
+    const Eigen::MatrixXd& mass_matrix,
     const std::array<std::size_t, N>& vertices)
 {
-    if (mass_matrix.rows() != mass_matrix.cols() || mass_matrix.rows() % 3 != 0 ||
-        static_cast<std::size_t>(mass_matrix.rows() / 3) != vertex_count) {
-        throw std::invalid_argument("Constraint requires a lumped mass matrix for the mesh");
-    }
-
     diffxpbd::Vecd<static_cast<int>(3 * N)> masses;
     for (std::size_t local = 0; local < N; ++local) {
         const auto first_dof = 3 * static_cast<Eigen::Index>(vertices[local]);
         masses.template segment<3>(static_cast<Eigen::Index>(3 * local)) =
             mass_matrix.diagonal().segment<3>(first_dof);
-    }
-    if (!masses.allFinite() || (masses.array() < 0.0).any()) {
-        throw std::invalid_argument("Constraint requires finite, nonnegative masses");
     }
     return masses;
 }
@@ -481,15 +431,7 @@ void calMembraneConstraint_i(const std::vector<Eigen::Vector3d>& positions, cons
 {
 
     const auto triangle_index = static_cast<std::size_t>(index);
-    const auto& dofs = m.indices_membrane[triangle_index];
-    std::array<std::size_t, 3> vertices;
-    for (std::size_t local = 0; local < vertices.size(); ++local) {
-        const auto first_dof = dofs[static_cast<Eigen::Index>(3 * local)];
-        if (first_dof < 0 || first_dof % 3 != 0) {
-            throw std::invalid_argument("Invalid cached membrane vertex DOF");
-        }
-        vertices[local] = static_cast<std::size_t>(first_dof / 3);
-    }
+    const auto& vertices = m.triangles[triangle_index].indices;
 
     const auto& rest_inverse = s.Dm_inv[triangle_index];
     const auto F = membraneDeformationGradient(positions, vertices, rest_inverse);
@@ -511,11 +453,8 @@ void calMembraneConstraint_i(const std::vector<Eigen::Vector3d>& positions, cons
         jacobian.block<1, 3>(2, column) = (du * F.col(1) + dv * F.col(0)).transpose();
 
     }
-    if (!jacobian.allFinite()) {
-        throw std::invalid_argument("Nonfinite membrane strain Jacobian");
-    }
 
-    const auto masses = localMassDiagonal(s.M, positions.size(), vertices);
+    const auto masses = localMassDiagonal(s.M, vertices);
     constraint = strain;
     constraint_derivatives = jacobian;
     constraint_mass_matrix = masses.asDiagonal();
@@ -531,10 +470,11 @@ void calBendingConstraint_i(const std::vector<Eigen::Vector3d>& positions, const
     const auto& hinge = m.bending_hinges[static_cast<std::size_t>(index)];
     diffxpbd::Mat112 jacobian;
     const auto angle = signedDihedral(positions, hinge, &jacobian);
+    if (!angle) throw std::runtime_error("Degenerate triangle in bending constraint");
 
     const std::array<std::size_t, 4> vertices{
         hinge.edge[0], hinge.edge[1], hinge.opposite[0], hinge.opposite[1]};
-    const auto masses = localMassDiagonal(s.M, positions.size(), vertices);
+    const auto masses = localMassDiagonal(s.M, vertices);
 
     constraint = std::remainder(*angle - hinge.rest_angle, two_pi);
     constraint_derivatives = jacobian;
@@ -550,19 +490,13 @@ namespace {
 	c) if a new contact is detected, the multiplier is initialized to 0.
     d) 
 */
-bool advanceStateOnce(const mesh& m, const material& mat, const parameters& params, state& s,
-                      const diffxpbd::ColliderInput* collider, diffxpbd::ContactDetector* detector = nullptr)
+bool advanceStateOnce(const mesh& m, const material& mat, const parameters& params, state& s)
 {
     const double dt2 = params.timestep * params.timestep;
 
-    // calculate external force
-    if (!calExternalForce(m, params, s)) {
-        return false;
-    }
+    // Masses and topology were validated by initializeState.
+    calExternalForce(m, params, s);
     const auto masses = s.M.diagonal();
-    if ((masses.array() <= 0.0).any()) {
-        return false;
-    }
 
     const auto maskPinnedInverseMasses = [&s](auto& inv_mass, const auto& indices) {
         for (Eigen::Index dof = 0; dof < indices.size(); dof += 3) {
@@ -593,80 +527,63 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
     s.contacts.clear();
     s.multiplier_contact.clear();
     s.contact_substeps = 1;
-    s.contact_reference_fallback = false;
 
 
-    using ContactKey = std::tuple<bool, int, std::array<std::size_t, 3>,
+    using ContactKey = std::tuple<int, std::array<std::size_t, 3>,
                                   int, std::array<std::size_t, 3>>;
     std::map<ContactKey, std::size_t> contact_indices;
-    // Detection is shared by the projection sweeps and final trajectory check.
-    // Once introduced, feature geometry stays fixed within a substep. Scheduled
-    // obstacle contacts may originate from endpoint proximity rather than TOI.
-    // Store their actual geometry for future derivatives and deterministic replay.
+    // Geometry stays fixed once a self-contact is introduced. Both feature
+    // gradients are retained for future local derivatives and adjoint replay.
     const auto detectContacts = [&](const auto& settings, const auto* known) {
-        std::vector<diffxpbd::Contact> detected;
-        if (collider) {
-            detected = detector->detectMeshContacts(s.position,
-                s.position_predicted_during_iteration, *collider, settings, known);
-        }
-        if (settings.self_collision) {
-            auto self = detector->detectSelfContacts(s.position,
-                s.position_predicted_during_iteration, settings, known);
-            detected.insert(detected.end(), self.begin(), self.end());
-        }
-        return detected;
+        if (!settings.self_collision) return std::vector<diffxpbd::Contact>{};
+        return diffxpbd::detectSelfContacts(m, s.position,
+            s.position_predicted_during_iteration, settings, known);
     };
     const auto refreshContacts = [&]() {
         auto detected = detectContacts(params.contact, &s.contacts);
         for (auto& contact : detected) {
-            const ContactKey key{contact.self_contact, static_cast<int>(contact.cloth.feature_type), contact.cloth.indices,
-                                 static_cast<int>(contact.obstacle.feature_type), contact.obstacle.indices};
+            const ContactKey key{static_cast<int>(contact.first.feature_type), contact.first.indices,
+                                 static_cast<int>(contact.second.feature_type), contact.second.indices};
             if (contact_indices.emplace(key, s.contacts.size()).second) {
                 s.contacts.push_back(std::move(contact));
                 s.multiplier_contact.push_back(0.0);
             }
         }
     };
-    // Scheduling restarts for every trial substep, even if its position buffers
-    // happen to fit an earlier trial's envelope. The initial query always uses CCD.
-    if (detector) detector->beginSubstep();
     // Keep the original impact side when the same pair is found after projection.
     refreshContacts();
-    const auto projectContacts = [&]() {
+    const auto computeContactConstraint = [&]() {
         refreshContacts();
         const double alpha_tilde = params.contact.compliance / dt2;
         for (std::size_t i = 0; i < s.contacts.size(); ++i) {
             const auto& contact = s.contacts[i];
             const auto evaluation = diffxpbd::evaluateContact(contact,
-                s.position_predicted_during_iteration, contact.self_contact
-                    ? s.position_predicted_during_iteration : collider->step.end_positions,
-                params.contact.separation);
+                s.position_predicted_during_iteration, params.contact.separation);
             double inverse_effective_mass = 0.0;
             std::array<Eigen::Vector3d, 3> directions;
-            for (std::size_t j = 0; j < contact.cloth.vertex_count(); ++j) {
-                const auto vertex = contact.cloth.indices[j];
+            for (std::size_t j = 0; j < contact.first.vertex_count(); ++j) {
+                const auto vertex = contact.first.indices[j];
                 directions[j].setZero();
                 if (!s.pinned_positions[vertex]) {
-                    directions[j] = evaluation.cloth_jacobian.row(j).transpose().cwiseQuotient(
+                    directions[j] = evaluation.first_jacobian.row(j).transpose().cwiseQuotient(
                         masses.segment<3>(3 * vertex));
-                    inverse_effective_mass += evaluation.cloth_jacobian.row(j).dot(directions[j]);
+                    inverse_effective_mass += evaluation.first_jacobian.row(j).dot(directions[j]);
                 }
             }
             // Self-contact transfers equal and opposite impulses between two
             // dynamic features. Include BOTH sides in J M^-1 J^T and in scatter.
             // Incident features were filtered, so no vertex appears on both sides.
             std::array<Eigen::Vector3d, 3> other_directions;
-            if (contact.self_contact) {
-                for (std::size_t j = 0; j < contact.obstacle.vertex_count(); ++j) {
-                    const auto vertex = contact.obstacle.indices[j];
-                    other_directions[j].setZero();
-                    if (!s.pinned_positions[vertex]) {
-                        other_directions[j] = evaluation.obstacle_jacobian.row(j).transpose().cwiseQuotient(
-                            masses.segment<3>(3 * vertex));
-                        inverse_effective_mass += evaluation.obstacle_jacobian.row(j).dot(other_directions[j]);
-                    }
+            for (std::size_t j = 0; j < contact.second.vertex_count(); ++j) {
+                const auto vertex = contact.second.indices[j];
+                other_directions[j].setZero();
+                if (!s.pinned_positions[vertex]) {
+                    other_directions[j] = evaluation.second_jacobian.row(j).transpose().cwiseQuotient(
+                        masses.segment<3>(3 * vertex));
+                    inverse_effective_mass += evaluation.second_jacobian.row(j).dot(other_directions[j]);
                 }
             }
+
             // An immovable, violated contact is infeasible. Let the transactional
             // caller retry or report failure rather than silently accepting it.
             if (inverse_effective_mass == 0.0) {
@@ -680,19 +597,15 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
             // releases its accumulated multiplier toward zero. Apply only the
             // multiplier change, so repeated sweeps do not reapply old impulses.
             const double next_multiplier = std::max(0.0, multiplier + increment);
-            if (!std::isfinite(increment) || !std::isfinite(next_multiplier)) return false;
-            for (std::size_t j = 0; j < contact.cloth.vertex_count(); ++j) {
-                auto& position = s.position_predicted_during_iteration[contact.cloth.indices[j]];
+            for (std::size_t j = 0; j < contact.first.vertex_count(); ++j) {
+                auto& position = s.position_predicted_during_iteration[contact.first.indices[j]];
                 position += directions[j] * (next_multiplier - multiplier);
-                if (!position.allFinite()) return false;
             }
-            if (contact.self_contact) {
-                for (std::size_t j = 0; j < contact.obstacle.vertex_count(); ++j) {
-                    auto& position = s.position_predicted_during_iteration[contact.obstacle.indices[j]];
-                    position += other_directions[j] * (next_multiplier - multiplier);
-                    if (!position.allFinite()) return false;
-                }
+            for (std::size_t j = 0; j < contact.second.vertex_count(); ++j) {
+                auto& position = s.position_predicted_during_iteration[contact.second.indices[j]];
+                position += other_directions[j] * (next_multiplier - multiplier);
             }
+
             multiplier = next_multiplier;
         }
         return true;
@@ -720,9 +633,6 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
                 const diffxpbd::Mat33 lhs = J * inv_mass.asDiagonal() * J.transpose() + alpha_tilde;
                 const Eigen::Vector3d rhs =
                     -constraint - alpha_tilde * s.multiplier_membrane[i];
-                if (!lhs.allFinite() || !rhs.allFinite()) {
-                    return false;
-                }
                 const Eigen::LDLT<diffxpbd::Mat33> factorization(lhs);
                 if (factorization.info() != Eigen::Success ||
                     (factorization.vectorD().array() <= 0.0).any()) {
@@ -731,9 +641,6 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
                 const Eigen::Vector3d delta_multiplier = factorization.solve(rhs);
                 const diffxpbd::Vec9d delta_x =
                     inv_mass.cwiseProduct(J.transpose() * delta_multiplier);
-                if (!delta_multiplier.allFinite() || !delta_x.allFinite()) {
-                    return false;
-                }
                 s.multiplier_membrane[i] += delta_multiplier;
                 
                 const auto [a, b, c] = m.triangles[i].indices;
@@ -764,9 +671,6 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
                     (-constraint - alpha_tilde * s.multiplier_bending[i]) / denominator;
                 const diffxpbd::Vecd<12> delta_x =
                     inv_mass.cwiseProduct(J.transpose() * delta_multiplier);
-                if (!std::isfinite(delta_multiplier) || !delta_x.allFinite()) {
-                    return false;
-                }
                 s.multiplier_bending[i] += delta_multiplier;
                 const auto& hinge = m.bending_hinges[i];
                 s.position_predicted_during_iteration[hinge.edge[0]] += delta_x.segment<3>(0);
@@ -775,8 +679,8 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
                 s.position_predicted_during_iteration[hinge.opposite[1]] += delta_x.segment<3>(9);
             }
 
-            // Refresh and project cloth-obstacle mesh contacts
-            if (!projectContacts()) {
+            // Refresh and project cloth self-contacts
+            if (!computeContactConstraint()) {
                 return false;
             }
             iteration++;
@@ -804,9 +708,6 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
                 const diffxpbd::Mat33 lhs = J * inv_mass.asDiagonal() * J.transpose() + alpha_tilde;
                 const Eigen::Vector3d rhs =
                     -constraint - alpha_tilde * s.multiplier_membrane[i];
-                if (!lhs.allFinite() || !rhs.allFinite()) {
-                    return false;
-                }
                 const Eigen::LDLT<diffxpbd::Mat33> factorization(lhs);
                 if (factorization.info() != Eigen::Success ||
                     (factorization.vectorD().array() <= 0.0).any()) {
@@ -815,9 +716,6 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
                 const Eigen::Vector3d delta_multiplier = factorization.solve(rhs);
                 const diffxpbd::Vec9d delta_x =
                     inv_mass.cwiseProduct(J.transpose() * delta_multiplier);
-                if (!delta_multiplier.allFinite() || !delta_x.allFinite()) {
-                    return false;
-                }
                 s.multiplier_membrane[i] += delta_multiplier;
                 const auto [a, b, c] = m.triangles[i].indices;
                 s.position_predicted_during_iteration[a] += delta_x.segment<3>(0);
@@ -847,9 +745,6 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
                     (-constraint - alpha_tilde * s.multiplier_bending[i]) / denominator;
                 const diffxpbd::Vecd<12> delta_x =
                     inv_mass.cwiseProduct(J.transpose() * delta_multiplier);
-                if (!std::isfinite(delta_multiplier) || !delta_x.allFinite()) {
-                    return false;
-                }
                 s.multiplier_bending[i] += delta_multiplier;
                 const auto& hinge = m.bending_hinges[i];
                 s.position_predicted_during_iteration[hinge.edge[0]] += delta_x.segment<3>(0);
@@ -858,8 +753,8 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
                 s.position_predicted_during_iteration[hinge.opposite[1]] += delta_x.segment<3>(9);
             }
 
-            // Refresh and project cloth-obstacle mesh contacts
-            if (!projectContacts()) {
+            // Refresh and project cloth self-contacts
+            if (!computeContactConstraint()) {
                 return false;
             }
 			s.position_predicted_after_iteration = s.position_predicted_during_iteration;
@@ -869,10 +764,10 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
     }
 
 
-    if (collider || params.contact.self_collision) {
+    if (params.contact.self_collision) {
         for (int pass = 0; pass < params.contact.max_extra_contact_sweeps; ++pass) {
             const auto count = s.contacts.size();
-            if (!projectContacts()) return false;
+            if (!computeContactConstraint()) return false;
             if (s.contacts.size() == count) break;
         }
         s.position_predicted_after_iteration = s.position_predicted_during_iteration;
@@ -883,10 +778,9 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
         const auto crossings = detectContacts(crossing_settings,
             static_cast<const std::vector<diffxpbd::Contact>*>(nullptr));
         for (const auto& contact : crossings) {
-            const double toi = *contact.time_of_impact;
+            const double toi = contact.time_of_impact;
             const double final_gap = diffxpbd::evaluateContact(contact,
-                s.position_predicted_during_iteration, contact.self_contact
-                    ? s.position_predicted_during_iteration : collider->step.end_positions, 0.0).gap;
+                s.position_predicted_during_iteration, 0.0).gap;
             if (toi > 1e-8 || final_gap < -params.contact.ccd_tolerance) return false;
         }
     }
@@ -894,6 +788,8 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
     const auto& projected_positions = params.JacobiSolver
         ? s.position_predicted_after_iteration
         : s.position_predicted_during_iteration;
+    for (const auto& position : projected_positions)
+        if (!position.allFinite()) return false;
     for (std::size_t i = 0; i < s.velocity.size(); ++i) {
         if (s.pinned_positions[i]) {
             s.velocity[i].setZero();
@@ -908,48 +804,14 @@ bool advanceStateOnce(const mesh& m, const material& mat, const parameters& para
 
 } // namespace
 
-bool advanceState(const mesh& m, const material& mat, const parameters& params, state& s,
-                  const diffxpbd::ColliderInput* collider)
+bool advanceState(const mesh& m, const material& mat, const parameters& params, state& s)
 {
-    const double dt2 = params.timestep * params.timestep;
     const auto& settings = params.contact;
-    if (!(params.timestep > 0.0) || !std::isfinite(dt2) || dt2 <= 0.0 ||
-        !std::isfinite(settings.separation) || settings.separation <= 0.0 ||
-        !std::isfinite(settings.compliance) || settings.compliance < 0.0 ||
-        !std::isfinite(settings.compliance / dt2) ||
-        !std::isfinite(settings.collision_cache_padding) || settings.collision_cache_padding < 0.0 ||
-        !std::isfinite(settings.ccd_tolerance) || settings.ccd_tolerance <= 0.0 ||
-        settings.max_extra_contact_sweeps < 1 ||
+    if (!(params.timestep > 0.0) || params.totalIterations < 1 ||
         settings.max_extra_contact_step_levels < 0 ||
-        settings.max_extra_contact_step_levels > 10 || params.totalIterations < 1) return false;
-    if (!collider && !settings.self_collision)
-        return advanceStateOnce(m, mat, params, s, nullptr);
+        settings.max_extra_contact_step_levels > 10) return false;
+    if (!settings.self_collision) return advanceStateOnce(m, mat, params, s);
 
-    if (collider) {
-        const auto& motion = collider->step;
-        const double duration = motion.end_time - motion.start_time;
-        const double tolerance = 32.0 * std::numeric_limits<double>::epsilon() *
-            std::max({1.0, std::abs(motion.start_time), std::abs(motion.end_time), params.timestep});
-        if (!std::isfinite(motion.start_time) || !std::isfinite(motion.end_time) ||
-            std::abs(duration - params.timestep) > tolerance ||
-            motion.start_positions.size() < 3 ||
-            motion.start_positions.size() != motion.end_positions.size() ||
-            collider->triangles.empty()) return false;
-        for (std::size_t i = 0; i < motion.start_positions.size(); ++i)
-            if (!motion.start_positions[i].allFinite() || !motion.end_positions[i].allFinite()) return false;
-        for (const auto& triangle : collider->triangles)
-            for (const auto vertex : triangle)
-                if (vertex >= motion.start_positions.size()) return false;
-    }
-
-    // Acceleration data lives outside trial state copies. Reuse topology and BVH
-    // partitions across all sweeps, retries and accepted internal substeps.
-    // Each query checks its motion envelope and current primitive bounds, so a
-    // failed trial cannot leave stale bounds that hide a later collision.
-    diffxpbd::ContactDetector detector(m);
-
-    // Every retry starts from the original state. Self-contact needs the same
-    // rollback and smaller-substep handling even when there is no obstacle.
     for (int level = 0; level <= settings.max_extra_contact_step_levels; ++level) {
         const int count = 1 << level;
         state trial = s;
@@ -957,24 +819,8 @@ bool advanceState(const mesh& m, const material& mat, const parameters& params, 
         substep_params.timestep = params.timestep / count;
         bool success = true;
         for (int substep = 0; substep < count; ++substep) {
-            std::optional<diffxpbd::ColliderInput> input;
-            if (collider) {
-                const auto& motion = collider->step;
-                const double duration = motion.end_time - motion.start_time;
-                const double begin = static_cast<double>(substep) / count;
-                const double end = static_cast<double>(substep + 1) / count;
-                diffxpbd::ColliderStep sampled{
-                    motion.start_time + begin * duration, motion.start_time + end * duration, {}, {}};
-                for (std::size_t i = 0; i < motion.start_positions.size(); ++i) {
-                    sampled.start_positions.push_back((1.0 - begin) * motion.start_positions[i] +
-                                                      begin * motion.end_positions[i]);
-                    sampled.end_positions.push_back((1.0 - end) * motion.start_positions[i] +
-                                                    end * motion.end_positions[i]);
-                }
-                input.emplace(diffxpbd::ColliderInput{collider->triangles, std::move(sampled)});
-            }
             try {
-                success = advanceStateOnce(m, mat, substep_params, trial, input ? &*input : nullptr, &detector);
+                success = advanceStateOnce(m, mat, substep_params, trial);
             } catch (const std::runtime_error&) {
                 success = false;
             }
@@ -983,18 +829,6 @@ bool advanceState(const mesh& m, const material& mat, const parameters& params, 
         if (success) {
             trial.contact_substeps = count;
             s = std::move(trial);
-            return true;
-        }
-    }
-    // Proximity scheduling changes when new contacts are introduced. If all
-    // scheduled attempts fail, restart the ENTIRE requested step from the
-    // untouched caller state using the full per-sweep search. Record this choice
-    // alongside the accepted subdivision count for future deterministic replay.
-    if (settings.cache_collision_queries) {
-        parameters reference = params;
-        reference.contact.cache_collision_queries = false;
-        if (advanceState(m, mat, reference, s, collider)) {
-            s.contact_reference_fallback = true;
             return true;
         }
     }

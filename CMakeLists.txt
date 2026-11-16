@@ -39,7 +39,6 @@ endif()
 add_library(diffxpbd_core STATIC
     src/build_info.cpp
     src/xpbd.cpp
-    src/kinematic_collider.cpp
     src/contact.cpp
     src/linearization.cpp
     src/adjoint.cpp
@@ -51,7 +50,6 @@ target_sources(diffxpbd_core
     FILES
         include/diffxpbd/build_info.hpp
         include/diffxpbd/xpbd.hpp
-        include/diffxpbd/kinematic_collider.hpp
         include/diffxpbd/contact.hpp
         include/diffxpbd/linearization.hpp
         include/diffxpbd/adjoint.hpp
@@ -77,13 +75,13 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-    add_executable(mesh_contact_test tests/mesh_contact.cpp)
-    target_link_libraries(mesh_contact_test PRIVATE DiffXPBD::core)
+    add_executable(self_contact_test tests/self_contact.cpp)
+    target_link_libraries(self_contact_test PRIVATE DiffXPBD::core)
     if(MSVC)
-        target_compile_options(mesh_contact_test PRIVATE /utf-8)
+        target_compile_options(self_contact_test PRIVATE /utf-8)
     endif()
-    add_test(NAME mesh_contact COMMAND mesh_contact_test)
-    set_tests_properties(mesh_contact PROPERTIES TIMEOUT 120)
+    add_test(NAME self_contact COMMAND self_contact_test)
+    set_tests_properties(self_contact PROPERTIES TIMEOUT 120)
 endif()
 
 if(DIFFXPBD_ENABLE_CUDA)

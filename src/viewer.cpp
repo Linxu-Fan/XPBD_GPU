@@ -152,9 +152,6 @@ struct Viewer::Impl
 
 Viewer::Viewer(const mesh& rest_mesh) : impl_(std::make_unique<Impl>())
 {
-    if (rest_mesh.vertices.empty()) {
-        throw std::runtime_error("Viewer requires a nonempty mesh");
-    }
     Eigen::Vector3d minimum = rest_mesh.vertices.front();
     Eigen::Vector3d maximum = minimum;
     for (const auto& position : rest_mesh.vertices) {
@@ -240,8 +237,7 @@ bool Viewer::needsRedraw() const
     return impl_->redraw;
 }
 
-void Viewer::draw(const mesh& m, const state& s, int step, double time, bool finished,
-                  const ColliderInput* collider)
+void Viewer::draw(const mesh& m, const state& s, int step, double time, bool finished)
 {
     RECT bounds;
     GetClientRect(impl_->window, &bounds);
@@ -293,20 +289,6 @@ void Viewer::draw(const mesh& m, const state& s, int step, double time, bool fin
                 glVertex3dv(s.position[triangle.indices[edge]].data());
                 glVertex3dv(s.position[triangle.indices[(edge + 1) % 3]].data());
             }
-        }
-        glEnd();
-    }
-    if (collider) {
-        glBegin(GL_TRIANGLES);
-        const auto& positions = collider->step.end_positions;
-        for (const auto& [a, b, c] : collider->triangles) {
-            const Eigen::Vector3d normal =
-                (positions[b] - positions[a]).cross(positions[c] - positions[a]).normalized();
-            const double shade = 0.4 + 0.6 * std::abs(normal.dot(light));
-            glColor3d(0.65 * shade, 0.65 * shade, 0.65 * shade);
-            glVertex3dv(positions[a].data());
-            glVertex3dv(positions[b].data());
-            glVertex3dv(positions[c].data());
         }
         glEnd();
     }

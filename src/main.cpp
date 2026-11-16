@@ -12,7 +12,6 @@
 #include <iostream>
 #include <thread>
 #include <utility>
-#include <vector>
 
 namespace {
 
@@ -20,11 +19,7 @@ namespace {
 // dense mass matrix, constraint caches, or contact solver buffers for a frame.
 struct RenderFrame
 {
-    explicit RenderFrame(const std::vector<diffxpbd::KinematicCollider::Triangle>& triangles)
-        : collider{triangles, {}} {}
-
     state cloth;
-    diffxpbd::ColliderInput collider;
     int step = 0;
 };
 
@@ -62,25 +57,9 @@ int main()
     try {
         // Initialize the state
         mesh clothMesh;
-        mesh obstacleMesh;
         parameters simParams;
         material clothMaterial;
         state simState;
-
-		// Load the obstacle mesh and create a kinematic collider with a constant upward velocity.   
-        importAnMesh("assets/remeshed/cube.obj", obstacleMesh);
-        std::vector<diffxpbd::KinematicCollider::Triangle> triangles;
-        for (const auto& triangle : obstacleMesh.triangles) triangles.push_back(triangle.indices);
-        const auto obstacleVertexCount = obstacleMesh.vertices.size();
-        const Eigen::Vector3d obstacleVelocity(0.0, 0.5, 0.0); // world-space velocity in m/s
-        diffxpbd::KinematicCollider collider(obstacleVertexCount, std::move(triangles),
-            [restPositions = obstacleMesh.vertices, obstacleVelocity](double time) {
-                auto positions = restPositions;
-                for (auto& position : positions) {
-                    position += obstacleVelocity * time;
-                }
-                return positions;
-            });
 
 		// Load the cloth mesh and initialize the simulation state.
         importAnMesh("assets/remeshed/skirt1252.obj", clothMesh);
@@ -91,30 +70,21 @@ int main()
 
         // Mark two stationary pinned vertices
         for (const std::size_t vertex : {std::size_t{74}, std::size_t{55}}) {
-            if (vertex >= clothMesh.vertices.size()) {
-                std::cerr << "The skirt is missing a waistband pin vertex\n";
-                return 1;
-            }
             simState.pinned_positions[vertex] = clothMesh.vertices[vertex];
         }
 
         std::filesystem::create_directories("output");
         diffxpbd::Viewer viewer(clothMesh);
         const double timestep = simParams.timestep;
-        auto initialFrame = std::make_shared<RenderFrame>(collider.triangles());
+        auto initialFrame = std::make_shared<RenderFrame>();
         initialFrame->cloth.position = simState.position;
         initialFrame->cloth.pinned_positions = simState.pinned_positions;
-        // Initial frame is at t=0, rather than showing the obstacle one step ahead.
-        const auto initial = collider.sample(0.0);
-        initialFrame->collider.step = {0.0, 0.0, initial, initial};
         std::shared_ptr<const RenderFrame> displayed = std::move(initialFrame);
-        viewer.draw(clothMesh, displayed->cloth, 0, 0.0, simParams.totalSteps <= 0,
-                    &displayed->collider);
+        viewer.draw(clothMesh, displayed->cloth, 0, 0.0, simParams.totalSteps <= 0);
 
         SimulationWorker simulation;
         simulation.thread = std::thread([&] {
             try {
-                diffxpbd::ColliderInput input{collider.triangles(), {}};
                 for (int step = 0; step < simParams.totalSteps; ++step) {
                     {
                         std::unique_lock<std::mutex> lock(simulation.mutex);
@@ -125,19 +95,14 @@ int main()
                         if (simulation.pending_steps > 0) --simulation.pending_steps;
                     }
 
-                    const double startTime = step * timestep;
-                    const double endTime = (step + 1) * timestep;
-                    input.step = collider.sampleStep(startTime, endTime);
-                    if (!advanceState(clothMesh, clothMaterial, simParams, simState, &input)) {
+                    if (!advanceState(clothMesh, clothMaterial, simParams, simState)) {
                         throw std::runtime_error("Simulation failed at timestep " + std::to_string(step));
                     }
                     exportStateAsObj("output/skirt.obj", clothMesh, simState, step);
-                    exportStateAsObj("output/cube.obj", obstacleMesh, input.step.end_positions, step);
 
-                    auto frame = std::make_shared<RenderFrame>(collider.triangles());
+                    auto frame = std::make_shared<RenderFrame>();
                     frame->cloth.position = simState.position;
                     frame->cloth.pinned_positions = simState.pinned_positions;
-                    frame->collider.step = input.step;
                     frame->step = step + 1;
                     {
                         std::lock_guard<std::mutex> lock(simulation.mutex);
@@ -179,8 +144,7 @@ int main()
             // snapshot without waiting for another simulation step.
             if (ready || viewer.needsRedraw()) {
                 viewer.draw(clothMesh, displayed->cloth, displayed->step,
-                            displayed->step * timestep, displayed->step >= simParams.totalSteps,
-                            &displayed->collider);
+                            displayed->step * timestep, displayed->step >= simParams.totalSteps);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(4));
         }

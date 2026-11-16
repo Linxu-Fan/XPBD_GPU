@@ -1,3 +1,5 @@
 /build/
-/tests/
+/tests/*
+!/tests/self_contact.cpp
+!/tests/cuda_smoke.cu
 /output/
